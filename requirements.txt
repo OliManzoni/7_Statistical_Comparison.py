@@ -1,0 +1,8 @@
+streamlit
+pandas
+numpy
+matplotlib
+statsmodels
+scipy
+scikit-learn
+pyabf

@@ -313,8 +313,31 @@ else:
         st.error(f"Colonnes manquantes : {missing}. Chargez bien les fichiers `_Sweeps.csv`.")
         st.stop()
 
+    # ── Y-axis mode toggle ────────────────────────────────────────────────────
+    st.markdown("#### 📈 Variable à tracer en ordonnée")
+    yaxis_mode = st.radio(
+        "Mode axe Y",
+        options=["Fréquence de décharge (Hz)", "Nombre de PAs (#APs)"],
+        index=0,
+        horizontal=True,
+        help=(
+            "**Hz** : Nb_Spikes divisé par la durée de l'échelon "
+            f"({STEP_DURATION_S} s) → fréquence instantanée moyenne.\n\n"
+            "**#APs** : Nb_Spikes brut — pratique pour comparer directement "
+            "le nombre de potentiels d'action sans normalisation temporelle."
+        )
+    )
+
+    use_hz = yaxis_mode == "Fréquence de décharge (Hz)"
+
+    # Column name and axis labels driven by the toggle
+    Y_COL   = 'Firing_Hz' if use_hz else 'Nb_Spikes'
+    Y_LABEL = 'Fréquence de décharge (Hz)' if use_hz else "Nombre de potentiels d'action (#APs)"
+    Y_SHORT = 'Hz' if use_hz else '#APs'
+    CURVE_TITLE = "Courbe I-F (I vs Fréquence)" if use_hz else "Courbe I-N (I vs #APs)"
+
     df_if = df_all[df_all['I_inj'] > 0].copy()
-    df_if['Firing_Hz'] = df_if['Nb_Spikes'] / STEP_DURATION_S
+    df_if['Firing_Hz'] = df_if['Nb_Spikes'] / STEP_DURATION_S   # always computed; used if Hz mode
 
     if df_if.empty:
         st.error("Aucun échelon dépolarisant (I_inj > 0) trouvé.")
@@ -349,25 +372,6 @@ else:
     )
 
     # ── Animal ID assignment ──────────────────────────────────────────────────
-    #
-    # Par défaut : 1 fichier CSV = 1 cellule = 1 animal distinct.
-    # Si plusieurs cellules viennent du même animal, l'utilisateur les regroupe
-    # ici via des champs texte (un par cellule chargée).
-    #
-    # Impact sur le LMM :
-    #   - 1 cellule = 1 animal  →  modèle simple  : (1 | Cell)
-    #     La cellule est l'unité de réplication et l'effet aléatoire.
-    #
-    #   - Plusieurs cellules par animal → modèle nested : (1 | Animal / Cell)
-    #     L'animal est l'effet aléatoire de niveau supérieur ;
-    #     la cellule est nichée à l'intérieur.
-    #     Ceci corrige la pseudo-réplication cellule-dans-animal :
-    #     deux cellules du même animal ne sont pas indépendantes.
-    #
-    # Le point-par-point Mann-Whitney reste au niveau cellule dans les deux cas
-    # (l'unité d'observation est la cellule), mais une note est affichée quand
-    # plusieurs cellules partagent un animal.
-
     st.divider()
     st.markdown("#### 🐭 Attribution Animal → Cellule(s)")
 
@@ -388,7 +392,6 @@ else:
     cell_to_animal = {}
 
     if not use_animal_grouping:
-        # Default: animal = cell
         for cell in all_cells:
             cell_to_animal[cell] = cell
         st.caption(
@@ -400,7 +403,6 @@ else:
             "Assignez un **identifiant animal** à chaque fichier CSV. "
             "Cellules avec le même ID = même animal."
         )
-        # Show inputs in a compact 2-column grid
         col_pairs = [all_cells[i:i+2] for i in range(0, len(all_cells), 2)]
         for pair in col_pairs:
             cols = st.columns(len(pair))
@@ -410,7 +412,6 @@ else:
                 val = col.text_input(f"🐭 `{cell}`", value=default_id, key=f"anid_{idx}")
                 cell_to_animal[cell] = val.strip() if val.strip() else default_id
 
-        # Live summary
         animal_counts = pd.Series(cell_to_animal).value_counts().sort_index()
         multi = animal_counts[animal_counts > 1]
         if not multi.empty:
@@ -425,7 +426,6 @@ else:
                 "LMM : **(1 | Cell)**."
             )
 
-    # Resolve how many unique animals per group
     n_animals_g1 = len(set(
         cell_to_animal.get(c, c)
         for c in df_if_common[df_if_common['Condition'] == grp1_name]['Cell'].unique()
@@ -435,41 +435,39 @@ else:
         for c in df_if_common[df_if_common['Condition'] == grp2_name]['Cell'].unique()
     ))
 
-    # Inject Animal column
     df_if_common = df_if_common.copy()
     df_if_common['Animal'] = df_if_common['Cell'].map(cell_to_animal)
 
-    # Determine nesting mode
     n_unique_animals = len(set(cell_to_animal.values()))
     is_nested = use_animal_grouping and (n_unique_animals < len(all_cells))
 
     st.divider()
 
-    # ── Per-cell means (unit of observation for point-by-point test) ──────────
-    cell_means = (df_if_common.groupby(['Condition', 'Animal', 'Cell', 'I_inj'])['Firing_Hz']
-                  .mean().reset_index())
+    # ── Per-cell means ────────────────────────────────────────────────────────
+    cell_means = (df_if_common.groupby(['Condition', 'Animal', 'Cell', 'I_inj'])[[
+        'Firing_Hz', 'Nb_Spikes'
+    ]].mean().reset_index())
 
-    # ── Mean ± SEM per group per step (for plot) ──────────────────────────────
-    agg = (cell_means.groupby(['Condition', 'I_inj'])['Firing_Hz']
+    # ── Mean ± SEM per group per step ─────────────────────────────────────────
+    agg = (cell_means.groupby(['Condition', 'I_inj'])[Y_COL]
            .agg(mean='mean', sem=lambda x: x.sem(), n='count')
            .reset_index())
     agg1 = agg[agg['Condition'] == grp1_name].sort_values('I_inj')
     agg2 = agg[agg['Condition'] == grp2_name].sort_values('I_inj')
 
     # ── Point-by-point Mann-Whitney + BH-FDR ─────────────────────────────────
-    # Unit of replication = Cell (one value per cell per I_inj step).
-    # When multiple cells come from the same animal, a note is shown in the UI.
     test_rows = []
     for step in common_steps:
         v1 = cell_means[(cell_means['Condition'] == grp1_name) &
-                        (cell_means['I_inj'] == step)]['Firing_Hz'].dropna()
+                        (cell_means['I_inj'] == step)][Y_COL].dropna()
         v2 = cell_means[(cell_means['Condition'] == grp2_name) &
-                        (cell_means['I_inj'] == step)]['Firing_Hz'].dropna()
+                        (cell_means['I_inj'] == step)][Y_COL].dropna()
         if len(v1) > 2 and len(v2) > 2:
             _, p_raw = stats.mannwhitneyu(v1, v2, alternative='two-sided')
             test_rows.append({'I_inj': step, 'p_raw': p_raw,
                                'n_cells_1': len(v1), 'n_cells_2': len(v2),
-                               'mean1': v1.mean(), 'mean2': v2.mean()})
+                               f'mean_{Y_SHORT}_1': v1.mean(),
+                               f'mean_{Y_SHORT}_2': v2.mean()})
 
     if test_rows:
         test_df = pd.DataFrame(test_rows)
@@ -483,7 +481,7 @@ else:
         test_df  = pd.DataFrame()
         sig_steps = pd.DataFrame()
 
-    # ── Plot I-F curves ───────────────────────────────────────────────────────
+    # ── Plot I-F (or I-N) curves ──────────────────────────────────────────────
     colors = {grp1_name: '#2196F3', grp2_name: '#F44336'}
     fig, ax = plt.subplots(figsize=(10, 6))
 
@@ -505,11 +503,11 @@ else:
             for cell in cell_means[cell_means['Condition'] == grp]['Cell'].unique():
                 cd = cell_means[(cell_means['Condition'] == grp) &
                                 (cell_means['Cell'] == cell)].sort_values('I_inj')
-                ax.plot(cd['I_inj'], cd['Firing_Hz'], color=col,
+                ax.plot(cd['I_inj'], cd[Y_COL], color=col,
                         alpha=0.18, lw=0.9, zorder=1)
 
     if not sig_steps.empty:
-        y_max   = df_if_common['Firing_Hz'].max()
+        y_max   = cell_means[Y_COL].max()
         y_range = y_max
         for _, row in sig_steps.iterrows():
             m1v = agg1[agg1['I_inj'] == row['I_inj']]['mean'].values
@@ -519,9 +517,9 @@ else:
                     ha='center', va='bottom', fontsize=12, fontweight='bold', color='black')
 
     ax.set_xlabel("Courant injecté (pA)", fontsize=12)
-    ax.set_ylabel("Fréquence de décharge (Hz)", fontsize=12)
+    ax.set_ylabel(Y_LABEL, fontsize=12)
     ax.set_title(
-        f"Courbes I-F : {grp1_name} vs {grp2_name}\n"
+        f"{CURVE_TITLE} : {grp1_name} vs {grp2_name}\n"
         f"Mean ± SEM | Mann-Whitney point-par-point + BH-FDR"
         + (" | Modèle nested (Animal/Cell)" if is_nested else ""),
         fontweight='bold'
@@ -534,57 +532,36 @@ else:
     st.pyplot(fig)
 
     # ── LMM ──────────────────────────────────────────────────────────────────
-    #
-    # Two models depending on whether animal grouping is active:
-    #
-    # A) Simple  (1 cell = 1 animal, default):
-    #    Firing_Hz ~ I_inj * Condition_bin
-    #    groups = Cell
-    #    → random intercept per cell
-    #
-    # B) Nested  (multiple cells per animal):
-    #    Firing_Hz ~ I_inj * Condition_bin
-    #    groups = Animal
-    #    exog_re = identity matrix  →  random intercept per animal
-    #    + a second MixedLM call with groups = Cell_within_animal to capture
-    #      residual cell variance (statsmodels doesn't support crossed random
-    #      effects natively; we use the Animal-level model as the primary
-    #      inference model and note the limitation).
-    #
-    # Fixed effects interpretation (both models):
-    #   Intercept           → baseline firing rate of grp1 at I_inj=0 (extrapolated)
-    #   I_inj               → slope of I-F curve for grp1 (Hz per pA)
-    #   Condition_bin       → vertical shift of grp2 relative to grp1
-    #   I_inj:Condition_bin → DIFFERENCE IN SLOPE = different gain between groups ★
-
     if run_lmm:
         st.divider()
+        lmm_y_label = Y_LABEL
+        lmm_y_col   = Y_COL
+
         if is_nested:
-            st.markdown("### 🧮 LMM Nested : Gain & Seuil de la Courbe I-F")
+            st.markdown(f"### 🧮 LMM Nested : Gain & Seuil de la Courbe ({Y_SHORT})")
             st.caption(
-                "Modèle : `Firing_Hz ~ I_inj × Condition + (1 | Animal)`\n\n"
+                f"Modèle : `{lmm_y_col} ~ I_inj × Condition + (1 | Animal)`\n\n"
                 "L'animal est l'unité de réplication biologique. "
                 "La cellule est nichée dans l'animal (pseudo-réplication corrigée). "
                 "L'interaction **I_inj × Condition** teste si les groupes ont un **gain différent**."
             )
         else:
-            st.markdown("### 🧮 LMM : Gain & Seuil de la Courbe I-F")
+            st.markdown(f"### 🧮 LMM : Gain & Seuil de la Courbe ({Y_SHORT})")
             st.caption(
-                "Modèle : `Firing_Hz ~ I_inj × Condition + (1 | Cell)`\n\n"
+                f"Modèle : `{lmm_y_col} ~ I_inj × Condition + (1 | Cell)`\n\n"
                 "La cellule est l'unité de réplication. "
                 "L'interaction **I_inj × Condition** teste si les groupes ont un **gain différent**."
             )
 
         lmm_df = cell_means.copy()
         lmm_df['Condition_bin'] = (lmm_df['Condition'] == grp2_name).astype(int)
-        lmm_data = lmm_df.dropna(subset=['Firing_Hz', 'I_inj'])
+        lmm_data = lmm_df.dropna(subset=[lmm_y_col, 'I_inj'])
 
-        # Choose grouping variable: Animal (nested) or Cell (simple)
         grouping_var = 'Animal' if is_nested else 'Cell'
 
         try:
             model  = mixedlm(
-                "Firing_Hz ~ I_inj * Condition_bin",
+                f"{lmm_y_col} ~ I_inj * Condition_bin",
                 lmm_data,
                 groups=lmm_data[grouping_var]
             )
@@ -593,7 +570,6 @@ else:
             df_res = lmm_summary_table(result, grp1_name, grp2_name)
             st.dataframe(df_res, use_container_width=True)
 
-            # Interpretation
             pv = result.pvalues
             p_inter = pv.get('I_inj:Condition_bin', np.nan)
             p_cond  = pv.get('Condition_bin', np.nan)
@@ -601,14 +577,15 @@ else:
             slope1  = fe.get('I_inj', np.nan)
             slope2  = slope1 + fe.get('I_inj:Condition_bin', 0)
 
+            unit = "Hz/pA" if use_hz else "APs/pA"
             interp = []
             if not np.isnan(p_inter):
                 if p_inter < 0.05:
                     interp.append(
                         f"✅ **Gain différent** entre {grp1_name} et {grp2_name} "
                         f"(interaction p={p_inter:.4f}) | "
-                        f"pente {grp1_name} = {slope1:.3f} Hz/pA, "
-                        f"pente {grp2_name} = {slope2:.3f} Hz/pA"
+                        f"pente {grp1_name} = {slope1:.3f} {unit}, "
+                        f"pente {grp2_name} = {slope2:.3f} {unit}"
                     )
                 else:
                     interp.append(
@@ -643,7 +620,7 @@ else:
     # ── Point-by-point results table ──────────────────────────────────────────
     if not test_df.empty:
         st.divider()
-        st.markdown("### 📋 Tests Mann-Whitney Point-par-Point (BH-FDR)")
+        st.markdown(f"### 📋 Tests Mann-Whitney Point-par-Point (BH-FDR) — {Y_SHORT}")
         if is_nested:
             st.caption(
                 f"⚠️ Le test point-par-point utilise la **cellule** comme unité (n = nb cellules). "
@@ -653,11 +630,14 @@ else:
         else:
             st.caption(f"n = nombre de cellules par groupe. "
                        f"Corrigé sur {len(test_df)} comparaisons (BH-FDR).")
+
         display_df = test_df.copy()
-        display_df.columns = ['I_inj (pA)', 'p brute',
-                               f'n cells {grp1_name}', f'n cells {grp2_name}',
-                               f'Mean Hz {grp1_name}', f'Mean Hz {grp2_name}',
-                               'p BH-adj', 'Sig.']
+        display_df.columns = (
+            ['I_inj (pA)', 'p brute',
+             f'n cells {grp1_name}', f'n cells {grp2_name}',
+             f'Mean {Y_SHORT} {grp1_name}', f'Mean {Y_SHORT} {grp2_name}',
+             'p BH-adj', 'Sig.']
+        )
         st.dataframe(display_df.round(4), use_container_width=True)
 
     # ── Export ────────────────────────────────────────────────────────────────
